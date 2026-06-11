@@ -179,6 +179,7 @@
       let isSending = false;
       let typingIndicator = null;
       let chatHistory = [];
+      let chatEnded = false;
 
       function scrollToBottom() {
         messagesContainer.scrollTop = messagesContainer.scrollHeight;
@@ -188,6 +189,13 @@
         const div = document.createElement("div");
         div.textContent = text;
         return div.innerHTML;
+      }
+
+      function endChat() {
+        chatEnded = true;
+        inputField.disabled = true;
+        sendButton.disabled = true;
+        inputField.placeholder = "Das Gespräch ist beendet.";
       }
 
       function addUserMessage(text) {
@@ -247,7 +255,7 @@
       async function sendMessage() {
         const userMessage = inputField.value.trim();
 
-        if (userMessage === "" || isSending) return;
+        if (userMessage === "" || isSending || chatEnded) return;
 
         isSending = true;
         sendButton.disabled = true;
@@ -276,10 +284,17 @@
 
           if (!response.ok) {
             addBotMessage(data.error || "Serverfehler.");
+            if (data.ended === true) {
+              endChat();
+            }
           } else {
             addBotMessage(data.reply);
             chatHistory.push({ role: "user", content: userMessage });
             chatHistory.push({ role: "assistant", content: data.reply });
+
+            if (data.ended === true) {
+              endChat();
+            }
           }
 
         } catch (error) {
@@ -288,9 +303,12 @@
           console.error(error);
         } finally {
           isSending = false;
-          sendButton.disabled = false;
-          inputField.disabled = false;
-          inputField.focus();
+
+          if (!chatEnded) {
+            sendButton.disabled = false;
+            inputField.disabled = false;
+            inputField.focus();
+          }
         }
       }
 
