@@ -1,21 +1,19 @@
-from flask import Flask, render_template, request, jsonify, session, redirect, url_for
+from flask import Flask, render_template, request, jsonify, session
 from dotenv import load_dotenv
-from werkzeug.security import generate_password_hash, check_password_hash
 import requests
 import os
 import json
 import re
-import psycopg2
-import psycopg2.extras
 
 load_dotenv()
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "bitte-spaeter-sicher-ersetzen")
+
 app.config["SESSION_COOKIE_SECURE"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "None"
 app.config["SESSION_COOKIE_PARTITIONED"] = True
-app.config["SESSION_COOKIE_NAME"] = "chatbot_session_v2"
+app.config["SESSION_COOKIE_NAME"] = "chatbot_session_v3"
 
 
 # -----------------------------
@@ -32,7 +30,7 @@ SEAFILE_BASE_URL = os.environ.get("SEAFILE_BASE_URL", "").strip()
 SEAFILE_TOKEN = os.environ.get("SEAFILE_TOKEN", "").strip()
 SEAFILE_REPO_ID = os.environ.get("SEAFILE_REPO_ID", "").strip()
 STUDY_DAY = os.environ.get("STUDY_DAY", "1").strip()
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+
 
 # -----------------------------
 # Hilfslisten für Anonymisierung
@@ -64,70 +62,9 @@ SAFE_CAPITALIZED_WORDS = {
     "November", "Dezember", "Deutsch", "Deutschland", "Der", "Die", "Das"
 }
 
-# -----------------------------
-# Datenbank
-# -----------------------------
-def get_db_connection():
-    if not DATABASE_URL:
-        raise Exception("DATABASE_URL ist nicht gesetzt.")
-    return psycopg2.connect(DATABASE_URL)
-
-
-def init_db():
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id SERIAL PRIMARY KEY,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
-def create_user(username, password):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    password_hash = generate_password_hash(password)
-
-    cur.execute("""
-        INSERT INTO users (username, password_hash)
-        VALUES (%s, %s)
-    """, (username, password_hash))
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
-def get_user_by_username(username):
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("""
-        SELECT id, username, password_hash
-        FROM users
-        WHERE username = %s
-    """, (username,))
-    user = cur.fetchone()
-    cur.close()
-    conn.close()
-    return user
-
-
-# Datenbank beim Start initialisieren
-try:
-    init_db()
-    print("Datenbank initialisiert.")
-except Exception as e:
-    print("Datenbank-Initialisierung fehlgeschlagen:", repr(e))
-
 
 # -----------------------------
-# Hilfsfunktionen
+# Seafile-Hilfsfunktionen
 # -----------------------------
 def seafile_headers():
     return {
@@ -136,181 +73,79 @@ def seafile_headers():
     }
 
 
-def require_login():
-    return "username" in session
-
-
-def get_current_username():
-    return session.get("username", "unknown")
-
-
 def make_safe_filename(value):
     value = value.strip()
     value = re.sub(r'[^a-zA-Z0-9_-]', '_', value)
     return value
 
 
-def get_participant_id():
-    # Nur für Template-Kompatibilität, falls index1.html noch participant_id anzeigt
-    return get_current_username()
+def get_current_vp():
+    return session.get("vp_id", "unknown")
 
 
 def get_chat_filename():
-    username = make_safe_filename(get_current_username())
-    return f"{username}_day{STUDY_DAY}.json"
+    vp_id = make_safe_filename(get_current_vp())
+    return f"{vp_id}_day{STUDY_DAY}.json"
 
 
 def get_chat_path():
     return f"/{get_chat_filename()}"
 
 
-def mask_capitalized_name_phrase(phrase):
-    words = phrase.split()
-    masked_words = []
+def list_seafile_root_files():
+    url = f"{SEAFILE_BASE_URL}/api2/repos/{SEAFILE_REPO_ID}/dir/"
+    params = {"p": "/"}
 
-    for w in words:
-        cleaned = w.strip(",.!?:;")
-        if cleaned in SAFE_CAPITALIZED_WORDS:
-            masked_words.append(w)
-        else:
-            suffix = w[len(cleaned):] if len(w) > len(cleaned) else ""
-            masked_words.append("[NAME]" + suffix)
-
-    return " ".join(masked_words)
-
-
-def anonymize_text(text):
-    if not text:
-        return text
-
-    # Strukturierte Daten
-    text = re.sub(r'[\w\.-]+@[\w\.-]+\.\w+', '[EMAIL]', text)
-    text = re.sub(r'(\+?\d[\d\s\/\-\(\)]{6,}\d)', '[PHONE]', text)
-    text = re.sub(r'https?://\S+|www\.\S+', '[URL]', text)
-    text = re.sub(r'\b[A-Z]{2}\d{2}[A-Z0-9]{10,30}\b', '[IBAN]', text)
-    text = re.sub(r'\b\d{5}\b', '[PLZ]', text)
-    text = re.sub(r'\b\d{1,2}\.\d{1,2}\.\d{2,4}\b', '[DATUM]', text)
-    text = re.sub(r'\b\d{1,2}/\d{1,2}/\d{2,4}\b', '[DATUM]', text)
-    text = re.sub(r'@[A-Za-z0-9_\.]+', '[USERNAME]', text)
-
-    # Adressen
-    text = re.sub(
-        r'\b[A-ZÄÖÜ][a-zäöüß\-]+(?:straße|str\.|weg|allee|platz|gasse|ring|ufer)\s+\d+[a-zA-Z]?\b',
-        '[ADRESSE]',
-        text,
-        flags=re.IGNORECASE
+    response = requests.get(
+        url,
+        headers=seafile_headers(),
+        params=params,
+        timeout=30
     )
 
-    text = re.sub(
-        r'\b(meine adresse ist|ich wohne in der|ich wohne in dem)\s+([^,.\n]+)',
-        r'\1 [ADRESSE]',
-        text,
-        flags=re.IGNORECASE
-    )
+    if response.status_code != 200:
+        raise Exception(f"Seafile-Dateiliste fehlgeschlagen: {response.status_code} {response.text}")
 
-    text = re.sub(
-        r'\b(ich wohne in|ich lebe in|ich komme aus|ich bin aus|mein wohnort ist)\s+([A-ZÄÖÜ][A-Za-zÄÖÜäöüß\-]+(?:\s+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß\-]+){0,4})',
-        r'\1 [ORT]',
-        text,
-        flags=re.IGNORECASE
-    )
+    data = response.json()
 
-    # Alter / Geburtsangaben
-    text = re.sub(
-        r'\b(geboren am|mein geburtsdatum ist)\s+[^,.\n]+',
-        r'\1 [DATUM]',
-        text,
-        flags=re.IGNORECASE
-    )
+    filenames = []
+    for item in data:
+        if item.get("type") == "file":
+            filenames.append(item.get("name", ""))
 
-    text = re.sub(
-        r'\bich bin\s+\d{1,3}\s+jahre?\s+alt\b',
-        'ich bin [ALTER] jahre alt',
-        text,
-        flags=re.IGNORECASE
-    )
+    return filenames
 
-    # Explizite Namensangaben
-    text = re.sub(
-        r'\b(Ich heiße|Mein Name ist|Ich bin)\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){0,2})',
-        r'\1 [NAME]',
-        text
-    )
 
-    text = re.sub(
-        r'\b(Herr|Frau|Dr\.|Prof\.)\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){0,2})',
-        r'\1 [NAME]',
-        text
-    )
+def get_next_vp_id():
+    """
+    Sucht in Seafile nach vorhandenen Dateien wie:
+    vp1_day1.json, vp2_day1.json, vp3_day1.json ...
 
-    text = re.sub(
-        r'\b(mein Freund|meine Freundin|mein Mann|meine Frau|mein Bruder|meine Schwester|meine Mutter|mein Vater|mein Sohn|meine Tochter|mein Kollege|meine Kollegin)\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){0,2})',
-        r'\1 [NAME]',
-        text,
-        flags=re.IGNORECASE
-    )
+    Danach wird die nächste freie Nummer vergeben.
+    """
+    filenames = list_seafile_root_files()
 
-    # Institutionen
-    text = re.sub(
-        r'\b(Ich arbeite bei|Ich arbeite an|Ich studiere an|Ich studiere bei|Ich bin an der|Ich bin bei)\s+([^,.\n]+)',
-        r'\1 [INSTITUTION]',
-        text,
-        flags=re.IGNORECASE
-    )
+    max_number = 0
 
-    # Feste Orte / Institutionen aus Listen
-    for city in sorted(COMMON_GERMAN_CITIES, key=len, reverse=True):
-        text = re.sub(rf'\b{re.escape(city)}\b', '[ORT]', text, flags=re.IGNORECASE)
+    for filename in filenames:
+        match = re.match(r"^vp(\d+)_day\d+\.json$", filename)
+        if match:
+            number = int(match.group(1))
+            if number > max_number:
+                max_number = number
 
-    for inst in sorted(INSTITUTIONS, key=len, reverse=True):
-        text = re.sub(rf'\b{re.escape(inst)}\b', '[INSTITUTION]', text, flags=re.IGNORECASE)
+    return f"vp{max_number + 1}"
 
-    # Namen nach typischen Kontexten
-    context_patterns = [
-        r'(\bmit)\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+)?)',
-        r'(\bbei)\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+)?)',
-        r'(\bvon)\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+)?)',
-        r'(\bfür)\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+)?)',
-        r'(\bzusammen mit)\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+)?)',
-        r'(\bneben)\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+)?)',
-        r'(\bgegenüber von)\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+)?)'
-    ]
 
-    for pattern in context_patterns:
-        def repl(match):
-            prefix = match.group(1)
-            name_phrase = match.group(2)
-            return f"{prefix} {mask_capitalized_name_phrase(name_phrase)}"
-        text = re.sub(pattern, repl, text)
-
-    # Verben + Name
-    verb_patterns = [
-        r'(\b(?:habe|hatte|treffe|traf|gesehen|sah|kenne|kannte|schrieb|schreibe|rief|rufe|kontaktierte|sprach mit|telefonierte mit|besuchte)\b)\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+)?)'
-    ]
-
-    for pattern in verb_patterns:
-        def repl2(match):
-            verb = match.group(1)
-            name_phrase = match.group(2)
-            return f"{verb} {mask_capitalized_name_phrase(name_phrase)}"
-        text = re.sub(pattern, repl2, text, flags=re.IGNORECASE)
-
-    # Weitere lockere Formulierungen
-    text = re.sub(
-        r'\b(war mit)\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+)?)',
-        lambda m: f"{m.group(1)} {mask_capitalized_name_phrase(m.group(2))}",
-        text,
-        flags=re.IGNORECASE
-    )
-
-    text = re.sub(
-        r'\b(habe mich mit)\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+)?)',
-        lambda m: f"{m.group(1)} {mask_capitalized_name_phrase(m.group(2))}",
-        text,
-        flags=re.IGNORECASE
-    )
-
-    return text
+def create_new_chat_session():
+    """
+    Wird bei jedem Reload von / ausgeführt.
+    Dadurch bekommt jeder Seitenaufruf eine neue VP-ID.
+    """
+    session.clear()
+    vp_id = get_next_vp_id()
+    session["vp_id"] = vp_id
+    return vp_id
 
 
 def get_upload_link():
@@ -356,6 +191,7 @@ def get_download_link():
 def load_chat_history_from_seafile():
     try:
         download_link = get_download_link()
+
         if not download_link:
             return []
 
@@ -432,43 +268,186 @@ def save_chat_history_to_seafile(chat_history):
         upload_new_file_to_seafile(file_bytes)
 
 
+# -----------------------------
+# Anonymisierung
+# -----------------------------
+def mask_capitalized_name_phrase(phrase):
+    words = phrase.split()
+    masked_words = []
+
+    for w in words:
+        cleaned = w.strip(",.!?:;")
+        if cleaned in SAFE_CAPITALIZED_WORDS:
+            masked_words.append(w)
+        else:
+            suffix = w[len(cleaned):] if len(w) > len(cleaned) else ""
+            masked_words.append("[NAME]" + suffix)
+
+    return " ".join(masked_words)
+
+
+def anonymize_text(text):
+    if not text:
+        return text
+
+    text = re.sub(r'[\w\.-]+@[\w\.-]+\.\w+', '[EMAIL]', text)
+    text = re.sub(r'(\+?\d[\d\s\/\-\(\)]{6,}\d)', '[PHONE]', text)
+    text = re.sub(r'https?://\S+|www\.\S+', '[URL]', text)
+    text = re.sub(r'\b[A-Z]{2}\d{2}[A-Z0-9]{10,30}\b', '[IBAN]', text)
+    text = re.sub(r'\b\d{5}\b', '[PLZ]', text)
+    text = re.sub(r'\b\d{1,2}\.\d{1,2}\.\d{2,4}\b', '[DATUM]', text)
+    text = re.sub(r'\b\d{1,2}/\d{1,2}/\d{2,4}\b', '[DATUM]', text)
+    text = re.sub(r'@[A-Za-z0-9_\.]+', '[USERNAME]', text)
+
+    text = re.sub(
+        r'\b[A-ZÄÖÜ][a-zäöüß\-]+(?:straße|str\.|weg|allee|platz|gasse|ring|ufer)\s+\d+[a-zA-Z]?\b',
+        '[ADRESSE]',
+        text,
+        flags=re.IGNORECASE
+    )
+
+    text = re.sub(
+        r'\b(meine adresse ist|ich wohne in der|ich wohne in dem)\s+([^,.\n]+)',
+        r'\1 [ADRESSE]',
+        text,
+        flags=re.IGNORECASE
+    )
+
+    text = re.sub(
+        r'\b(ich wohne in|ich lebe in|ich komme aus|ich bin aus|mein wohnort ist)\s+([A-ZÄÖÜ][A-Za-zÄÖÜäöüß\-]+(?:\s+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß\-]+){0,4})',
+        r'\1 [ORT]',
+        text,
+        flags=re.IGNORECASE
+    )
+
+    text = re.sub(
+        r'\b(geboren am|mein geburtsdatum ist)\s+[^,.\n]+',
+        r'\1 [DATUM]',
+        text,
+        flags=re.IGNORECASE
+    )
+
+    text = re.sub(
+        r'\bich bin\s+\d{1,3}\s+jahre?\s+alt\b',
+        'ich bin [ALTER] jahre alt',
+        text,
+        flags=re.IGNORECASE
+    )
+
+    text = re.sub(
+        r'\b(Ich heiße|Mein Name ist|Ich bin)\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){0,2})',
+        r'\1 [NAME]',
+        text
+    )
+
+    text = re.sub(
+        r'\b(Herr|Frau|Dr\.|Prof\.)\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){0,2})',
+        r'\1 [NAME]',
+        text
+    )
+
+    text = re.sub(
+        r'\b(mein Freund|meine Freundin|mein Mann|meine Frau|mein Bruder|meine Schwester|meine Mutter|mein Vater|mein Sohn|meine Tochter|mein Kollege|meine Kollegin)\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){0,2})',
+        r'\1 [NAME]',
+        text,
+        flags=re.IGNORECASE
+    )
+
+    text = re.sub(
+        r'\b(Ich arbeite bei|Ich arbeite an|Ich studiere an|Ich studiere bei|Ich bin an der|Ich bin bei)\s+([^,.\n]+)',
+        r'\1 [INSTITUTION]',
+        text,
+        flags=re.IGNORECASE
+    )
+
+    for city in sorted(COMMON_GERMAN_CITIES, key=len, reverse=True):
+        text = re.sub(rf'\b{re.escape(city)}\b', '[ORT]', text, flags=re.IGNORECASE)
+
+    for inst in sorted(INSTITUTIONS, key=len, reverse=True):
+        text = re.sub(rf'\b{re.escape(inst)}\b', '[INSTITUTION]', text, flags=re.IGNORECASE)
+
+    context_patterns = [
+        r'(\bmit)\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+)?)',
+        r'(\bbei)\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+)?)',
+        r'(\bvon)\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+)?)',
+        r'(\bfür)\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+)?)',
+        r'(\bzusammen mit)\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+)?)',
+        r'(\bneben)\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+)?)',
+        r'(\bgegenüber von)\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+)?)'
+    ]
+
+    for pattern in context_patterns:
+        def repl(match):
+            prefix = match.group(1)
+            name_phrase = match.group(2)
+            return f"{prefix} {mask_capitalized_name_phrase(name_phrase)}"
+
+        text = re.sub(pattern, repl, text)
+
+    verb_patterns = [
+        r'(\b(?:habe|hatte|treffe|traf|gesehen|sah|kenne|kannte|schrieb|schreibe|rief|rufe|kontaktierte|sprach mit|telefonierte mit|besuchte)\b)\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+)?)'
+    ]
+
+    for pattern in verb_patterns:
+        def repl2(match):
+            verb = match.group(1)
+            name_phrase = match.group(2)
+            return f"{verb} {mask_capitalized_name_phrase(name_phrase)}"
+
+        text = re.sub(pattern, repl2, text, flags=re.IGNORECASE)
+
+    text = re.sub(
+        r'\b(war mit)\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+)?)',
+        lambda m: f"{m.group(1)} {mask_capitalized_name_phrase(m.group(2))}",
+        text,
+        flags=re.IGNORECASE
+    )
+
+    text = re.sub(
+        r'\b(habe mich mit)\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+)?)',
+        lambda m: f"{m.group(1)} {mask_capitalized_name_phrase(m.group(2))}",
+        text,
+        flags=re.IGNORECASE
+    )
+
+    return text
+
+
+# -----------------------------
+# LLM
+# -----------------------------
 def ask_mistral(chat_history):
     messages = [
         {
             "role": "system",
             "content": (
-                 "Du bist ein sehr empathischer, warmer und emotional unterstützender Gesprächspartner in einer wissenschaftlichen Studie. "
-    "Deine Aufgabe ist es, mit der teilnehmenden Person ein kurzes Gespräch über ihren aktuellen Alltag zu führen. "
+                "Du bist ein sehr empathischer, warmer und emotional unterstützender Gesprächspartner in einer wissenschaftlichen Studie. "
+                "Deine Aufgabe ist es, mit der teilnehmenden Person ein kurzes Gespräch über ihren aktuellen Alltag zu führen. "
 
-    "Gesprächsstil: "
-    "Reagiere sehr freundlich, verständnisvoll, zugewandt und emotional unterstützend. "
-    "Zeige aktiv Mitgefühl und Verständnis für das, was die Person schreibt. "
-    "Bestätige die Gefühle und Erfahrungen der Person auf warme Weise. "
-    "Verwende in fast jeder Antwort mehrere passende Emojis, z. B. 😊💛✨🤗🌼. "
-    "Nutze eine lockere, freundliche und persönliche Sprache. "
-    "Antworte so, als würdest du mit einer guten Freundin oder einem guten Freund sprechen. "
-    "Halte deine Antworten eher kurz bis mittellang. "
-    "Stelle empathische, offene Anschlussfragen. "
+                "Gesprächsstil: "
+                "Reagiere sehr freundlich, verständnisvoll, zugewandt und emotional unterstützend. "
+                "Zeige aktiv Mitgefühl und Verständnis für das, was die Person schreibt. "
+                "Bestätige die Gefühle und Erfahrungen der Person auf warme Weise. "
+                "Verwende in fast jeder Antwort mehrere passende Emojis, z. B. 😊💛✨🤗🌼. "
+                "Nutze eine lockere, freundliche und persönliche Sprache. "
+                "Antworte so, als würdest du mit einer guten Freundin oder einem guten Freund sprechen. "
+                "Halte deine Antworten eher kurz bis mittellang. "
+                "Stelle empathische, offene Anschlussfragen. "
 
-    "Wichtige Regeln: "
-    "Gehe wertschätzend auf persönliche Aussagen ein. "
-    "Wenn die Person von Stress, Unsicherheit oder schwierigen Gefühlen berichtet, reagiere besonders verständnisvoll und unterstützend. "
-    "Vermeide Diagnosen, therapeutische Einschätzungen oder konkrete psychologische Ratschläge. "
-    "Teile keine eigenen Erfahrungen oder persönlichen Informationen. "
-    "Bleibe natürlich, warm und nahbar. "
+                "Wichtige Regeln: "
+                "Gehe wertschätzend auf persönliche Aussagen ein. "
+                "Wenn die Person von Stress, Unsicherheit oder schwierigen Gefühlen berichtet, reagiere besonders verständnisvoll und unterstützend. "
+                "Vermeide Diagnosen, therapeutische Einschätzungen oder konkrete psychologische Ratschläge. "
+                "Teile keine eigenen Erfahrungen oder persönlichen Informationen. "
+                "Bleibe natürlich, warm und nahbar. "
 
-    "Geeignete Gesprächseinstiege sind: "
-    "Wie geht es dir gerade mit deinem Alltag? 😊 "
-    "Was beschäftigt dich im Moment besonders? 💛 "
-    "Wie sieht dein Alltag aktuell aus, und wie fühlst du dich damit? ✨ "
+                "Geeignete Gesprächseinstiege sind: "
+                "Wie geht es dir gerade mit deinem Alltag? 😊 "
+                "Was beschäftigt dich im Moment besonders? 💛 "
+                "Wie sieht dein Alltag aktuell aus, und wie fühlst du dich damit? ✨ "
 
-    "Beispiele für passende Reaktionen sind: "
-    "Oh, das klingt wirklich nach einer vollen Zeit 😕💛 Ich kann gut verstehen, dass dich das beschäftigt. Was hilft dir im Moment ein bisschen dabei? ✨ "
-    "Danke, dass du das teilst 😊 Das klingt wirklich wichtig für dich. Wie geht es dir damit gerade? 💛 "
-    "Das kann ich total nachvollziehen 🤗 Gerade wenn viel zusammenkommt, kann das echt anstrengend sein. Was ist im Moment der wichtigste Teil deines Alltags? 🌼 "
-
-    "Antworte in einem natürlichen, warmen und einfachen Deutsch. "
-    "Der Fokus liegt auf einem empathischen, unterstützenden Gespräch mit vielen passenden Emojis."
+                "Antworte in einem natürlichen, warmen und einfachen Deutsch. "
+                "Der Fokus liegt auf einem empathischen, unterstützenden Gespräch mit vielen passenden Emojis."
             )
         }
     ]
@@ -507,140 +486,33 @@ def ask_mistral(chat_history):
 # -----------------------------
 # Routen
 # -----------------------------
-
-@app.route("/test_seafile_exact")
-def test_seafile_exact():
-    headers = {
-        "Authorization": f"Token {SEAFILE_TOKEN}",
-        "Accept": "application/json"
-    }
-
-    upload_url = f"{SEAFILE_BASE_URL}/api2/repos/{SEAFILE_REPO_ID}/upload-link/"
-    update_url = f"{SEAFILE_BASE_URL}/api2/repos/{SEAFILE_REPO_ID}/update-link/"
-    file_url = f"{SEAFILE_BASE_URL}/api2/repos/{SEAFILE_REPO_ID}/file/"
-
-    return jsonify({
-        "base_url_repr": repr(SEAFILE_BASE_URL),
-        "repo_id_repr": repr(SEAFILE_REPO_ID),
-        "token_length": len(SEAFILE_TOKEN) if SEAFILE_TOKEN else 0,
-        "upload_url": upload_url,
-        "update_url": update_url,
-        "file_url": file_url,
-        "chat_filename": get_chat_filename(),
-        "chat_path": get_chat_path()
-    })
-
-
-
-
-@app.route("/register", methods=["GET", "POST"])
-
-def register():
-
-    if request.method == "POST":
-
-        username = request.form.get("username", "").strip()
-
-        password = request.form.get("password", "").strip()
-
-        if not username or not password:
-
-            return render_template(
-
-                "register.html",
-
-                error="Bitte alle Felder ausfüllen."
-
-            )
-
-        if get_user_by_username(username):
-
-            return render_template(
-
-                "register.html",
-
-                error="Dieser Benutzername existiert bereits."
-
-            )
-
-        try:
-
-            create_user(username, password)
-
-            return render_template("register_success.html", username=username)
-
-        except Exception as e:
-
-            print("Registrierungsfehler:", repr(e))
-
-            return render_template(
-
-                "register.html",
-
-                error=f"Registrierung fehlgeschlagen: {str(e)}"
-
-            )
-
-    return render_template("register.html")
- 
-
-
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    if request.method == "POST":
-        username = request.form.get("username", "").strip()
-        password = request.form.get("password", "").strip()
-
-        try:
-            user = get_user_by_username(username)
-        except Exception as e:
-            print("Login-Datenbankfehler:", repr(e))
-            return render_template("login.html", error=f"Datenbankfehler: {str(e)}")
-
-        if user and check_password_hash(user["password_hash"], password):
-            session.clear()
-            session["username"] = user["username"]
-            return redirect(url_for("home"))
-
-        return render_template("login.html", error="Login fehlgeschlagen.")
-
-    return render_template("login.html")
-
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect(url_for("login"))
-
-
 @app.route("/")
 def home():
-    if not require_login():
-        return redirect(url_for("login"))
+    vp_id = create_new_chat_session()
 
     return render_template(
         "index1.html",
-        username=session["username"],
-        participant_id=get_participant_id()
+        username=vp_id,
+        participant_id=vp_id
     )
 
 
 @app.route("/load_chat", methods=["GET"])
 def load_chat():
-    if not require_login():
-        return jsonify({"error": "Nicht eingeloggt"}), 401
-
-    try:
-        chat_history = load_chat_history_from_seafile()
-        return jsonify({"chat_history": chat_history})
-    except Exception as e:
-        return jsonify({"error": f"Fehler beim Laden: {str(e)}"}), 500
+    """
+    Bei jedem Reload soll ein neuer leerer Chat angezeigt werden.
+    Deshalb wird hier keine alte Historie geladen.
+    """
+    return jsonify({
+        "chat_history": [],
+        "vp_id": get_current_vp()
+    })
 
 
 @app.route("/send", methods=["POST"])
 def send():
-    if not require_login():
-        return jsonify({"error": "Nicht eingeloggt"}), 401
+    if "vp_id" not in session:
+        session["vp_id"] = get_next_vp_id()
 
     data = request.get_json()
     user_message = data.get("message", "").strip()
@@ -659,7 +531,6 @@ def send():
 
         reply = ask_mistral(model_history)
 
-        # Nur anonymisierte Inhalte speichern
         chat_history.append({
             "role": "user",
             "content": anonymize_text(user_message)
@@ -672,39 +543,42 @@ def send():
 
         save_chat_history_to_seafile(chat_history)
 
-        return jsonify({"reply": reply})
+        return jsonify({
+            "reply": reply,
+            "vp_id": get_current_vp()
+        })
+
     except Exception as e:
         print("Fehler:", repr(e))
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/test_db")
-def test_db():
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT NOW();")
-        now = cur.fetchone()
-        cur.close()
-        conn.close()
-        return jsonify({
-            "database_connected": True,
-            "server_time": str(now[0])
-        })
-    except Exception as e:
-        return jsonify({
-            "database_connected": False,
-            "error": str(e)
-        }), 500
+@app.route("/test_seafile_exact")
+def test_seafile_exact():
+    upload_url = f"{SEAFILE_BASE_URL}/api2/repos/{SEAFILE_REPO_ID}/upload-link/"
+    update_url = f"{SEAFILE_BASE_URL}/api2/repos/{SEAFILE_REPO_ID}/update-link/"
+    file_url = f"{SEAFILE_BASE_URL}/api2/repos/{SEAFILE_REPO_ID}/file/"
+
+    return jsonify({
+        "base_url_repr": repr(SEAFILE_BASE_URL),
+        "repo_id_repr": repr(SEAFILE_REPO_ID),
+        "token_length": len(SEAFILE_TOKEN) if SEAFILE_TOKEN else 0,
+        "upload_url": upload_url,
+        "update_url": update_url,
+        "file_url": file_url,
+        "vp_id": get_current_vp(),
+        "chat_filename": get_chat_filename(),
+        "chat_path": get_chat_path()
+    })
 
 
 @app.route("/test_chatfile")
 def test_chatfile():
-    if not require_login():
-        return jsonify({"error": "Nicht eingeloggt"}), 401
+    if "vp_id" not in session:
+        session["vp_id"] = get_next_vp_id()
 
     return jsonify({
-        "username": session.get("username"),
+        "vp_id": session.get("vp_id"),
         "chat_filename": get_chat_filename(),
         "chat_path": get_chat_path()
     })
@@ -712,23 +586,15 @@ def test_chatfile():
 
 @app.route("/test_seafile")
 def test_seafile():
-    if not require_login():
-        return jsonify({"error": "Nicht eingeloggt"}), 401
-
-    headers = {
-        "Authorization": f"Token {SEAFILE_TOKEN}",
-        "Accept": "application/json"
-    }
-
     url = f"{SEAFILE_BASE_URL}/api2/repos/"
-    response = requests.get(url, headers=headers, timeout=30)
+    response = requests.get(url, headers=seafile_headers(), timeout=30)
 
     return jsonify({
         "status_code": response.status_code,
         "response_text": response.text,
         "base_url": SEAFILE_BASE_URL,
         "repo_id": SEAFILE_REPO_ID,
-        "username": session.get("username"),
+        "vp_id": session.get("vp_id"),
         "current_chat_file": get_chat_filename()
     })
 
@@ -756,6 +622,7 @@ def test_anonymization():
 def healthz():
     return "ok", 200
 
+
 @app.route("/test_models")
 def test_models():
     headers = {
@@ -778,31 +645,15 @@ def test_models():
         "data": data
     })
 
-@app.route("/test_users")
-def test_users():
-   try:
-       conn = get_db_connection()
-       cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-       cur.execute("SELECT id, username, created_at FROM users ORDER BY id;")
-       rows = cur.fetchall()
-       cur.close()
-       conn.close()
-       return jsonify(rows)
-   except Exception as e:
-       return jsonify({"error": str(e)}), 500
 
 @app.route("/test_session")
-
 def test_session():
-
     return jsonify({
-
-        "session_username": session.get("username"),
-
-        "logged_in": require_login()
-
+        "vp_id": session.get("vp_id"),
+        "chat_filename": get_chat_filename(),
+        "chat_path": get_chat_path()
     })
- 
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
